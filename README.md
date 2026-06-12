@@ -26,7 +26,7 @@ That's it. No npm, no Docker, no dependencies.
 
 ## When this is the right tool
 
-It's free. It doesn't need IT approval. It isn't bloated. It just does the job.
+It's free. No account, no password, no sign-up. It doesn't need IT approval. It isn't bloated. It just does the job.
 The single-file, no-server, no-account design isn't a limitation pretending to be a feature, it's the whole point. Some situations it actually fits:
 
 - **Sensitive personal data.** Health tracking, financial planning, anything you don't want sitting on a SaaS vendor's servers. A tool with zero network calls can't leak your data because there's nowhere for it to leak to. Open it offline and confirm for yourself.  
@@ -241,3 +241,112 @@ Keep the "single file, no dependencies" constraint. If a feature needs a library
 ## Acknowledgements
 
 UI patterns borrowed liberally from Trello and Jira. The world doesn't need another kanban tool, but it does need ones that don't phone home.
+
+---
+
+## How it works
+
+The principle: One HTML file. Open it in a browser. Everything runs locally.
+
+### The whole stack
+
+There isn't one. No build step, no bundler, no framework, no package manager, no server. The file is plain HTML, CSS, and JavaScript, written by hand and readable by anyone who opens it in a text editor.
+
+Concretely, `kanban.html` contains:
+
+- A `<style>` block with the UI styling.
+- A `<body>` with the static markup for the toolbar, the board container, and two hidden modal dialogs.
+- A `<script>` block containing all the logic: database access, rendering, drag and drop, markdown, event handling.
+
+That's it. No external dependencies. Nothing loaded from a CDN. No fonts fetched from Google. Open the file with your network unplugged and it works identically.
+
+### Storage
+
+Data lives in **IndexedDB**, a database built into every modern browser. It's structured (not just key-value strings), asynchronous, and gives you proper indexing on lookups.
+
+Four object stores:
+
+```
+swimlanes  { id, name, colour, position }
+columns    { id, name, position }
+cards      { id, swimlane_id, column_id, title, description, position, created_at }
+checklist  { id, card_id, text, done, position }
+```
+
+Each store auto-increments its `id`. `position` is an integer ordering within a parent (its swimlane and column for cards, its card for checklist items). When you drag a card to a new position, the app recomputes positions for the affected cells inside a single transaction.
+
+Two indices help with common queries:
+
+- `cards.by_swimlane_column` for fetching all cards in a given cell.
+- `checklist.by_card` for fetching all items belonging to a card.
+
+The database is scoped by the browser to the exact URL the file was loaded from. Open the file from a different path and you'll see an empty database. Open the same file in a different browser and you'll see an empty database. This is a browser security boundary, not a quirk of the app.
+
+On first load, the app calls `navigator.storage.persist()`, which asks the browser not to evict the data under storage pressure. Most browsers grant this automatically for local files. It's not bulletproof: aggressive privacy tooling, manual cookie clearing, or browser reinstalls can still wipe it. That's why Export JSON exists.
+
+### Rendering
+
+Vanilla DOM manipulation. No virtual DOM, no reactivity framework, no templating engine.
+
+The pattern is brute-force but appropriate at this scale: there's a single in-memory `state` object that mirrors the database. After any mutation, the app re-reads from IndexedDB, repopulates `state`, then clears the board container and rebuilds it from scratch. For a personal kanban with tens or hundreds of cards, this is fast enough that you can't perceive it. If the dataset ever grew to thousands of cards the approach would need to change, but it isn't going to.
+
+The board layout uses a CSS grid with one row per swimlane and one column per kanban column. Adding a column or swimlane changes the grid template; the rest follows automatically.
+
+### Drag and drop
+
+Native HTML5 drag and drop. Each card sets `draggable="true"` and emits `dragstart` with its ID. Each cell listens for `dragover` (to allow the drop) and `drop` (to perform the move).
+
+The drop handler does two things worth flagging:
+
+1. **Computes target position from the mouse Y coordinate.** It walks the cards already in the target cell, finds the first one whose vertical midpoint is below the cursor, and uses that index as the drop position. Drop into an empty cell or below all cards and you get appended.
+
+2. **Reorders siblings transactionally.** Moving a card out of its old cell shifts everything below it up by one position. Moving it into the new cell shifts everything from the target position downward by one. Both happen as part of the same logical operation, so the database never sees a state with duplicate or missing positions.
+
+No drag-and-drop library. The HTML5 API is enough for a single board.
+
+### Markdown
+
+A minimal hand-rolled renderer (about 30 lines), not a library. It handles:
+
+- Fenced code blocks (```` ``` ````)
+- Inline code (`` ` ``)
+- Bold (`**`) and italic (`*`)
+- Links (`[text](url)`)
+- Headings (`##`)
+- Paragraphs and line breaks
+
+It deliberately doesn't handle lists, tables, or anything more elaborate, because the checklist feature covers structured lists and the descriptions are meant to be short. If you want full markdown, swap the function for a library like `marked`. The renderer escapes HTML first and only injects tags it has generated itself, so you can't inject HTML through a description.
+
+### Persistence cycle
+
+Every user action follows the same shape:
+
+1. The handler updates IndexedDB.
+2. It then calls `loadBoard()`, which re-reads everything from the database into the in-memory `state`.
+3. The board renders from `state`.
+
+Saving happens on **blur** for text inputs (title, description, checklist item edits) and on **change** for checkboxes and dropdowns. There's no save button anywhere. Click out of a field and the data is in the database before you've moved your mouse to the next thing.
+
+### Export and import
+
+Export reads all four stores, wraps them in an envelope object with a timestamp and version number, serialises to JSON, creates a Blob, and triggers a download via a temporary `<a>` element. The whole operation is a few lines.
+
+Import is the reverse: read the file, parse the JSON, validate it has the expected top-level keys, ask for confirmation, clear all four stores, and write the imported records back. It's destructive (replaces all current data) rather than merging, because merging two kanban boards is a problem with no obvious right answer and I didn't want to invent one.
+
+### What isn't there
+
+Worth being explicit about absences:
+
+- **No service worker.** The file works offline because it has no network dependencies, not because anything is cached. Loading and reloading just works.
+- **No analytics, telemetry, or error reporting.** Nothing is sent anywhere. If you want to verify, open browser DevTools, go to the Network tab, and reload. You'll see one request (the HTML file itself) and nothing else.
+- **No authentication.** It's single-user by design and there's nothing to authenticate against anyway.
+- **No sync.** Each browser holds its own data. The only way to move data between browsers or machines is Export then Import.
+- **No backend.** Not even a thin one. If a feature would require a server (push notifications, multi-device sync, sharing), it isn't in scope for this project.
+
+### Why this approach
+
+Two reasons.
+
+First, **it makes the trust story simple.** A single readable HTML file with no network calls is verifiable in a way that any normal web app isn't. Anyone who can read JavaScript can audit the entire thing in 20 minutes.
+
+Second, **it removes every form of friction between "I want a kanban" and "I have a kanban".** No install, no account, no terms of service, no compatibility matrix, no version pinning. Whatever made this work today will keep working in five years because nothing it depends on is going anywhere.
